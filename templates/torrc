@@ -1,0 +1,7 @@
+SocksPort 0.0.0.0:9050
+ControlPort 0.0.0.0:9051
+HashedControlPassword @TOR_HASH@
+
+# Bitcoin Knots P2P hidden service
+HiddenServiceDir /data/knots-p2p
+HiddenServicePort @P2P_PORT@ @NET_PREFIX@.10:8334

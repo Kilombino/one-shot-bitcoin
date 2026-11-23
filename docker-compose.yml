@@ -1,0 +1,198 @@
+# One Shot Bitcoin: a Bitcoin (BLAKE2b) node with Lightning and DATUM mining.
+#
+# Do not run this file by hand: `./oneshot` passes it the two env files it
+# needs (the pinned versions and your own settings).
+
+name: oneshot
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "3" }
+
+services:
+  # The only web door. Every dashboard sits behind it, behind one password.
+  gate:
+    <<: *common
+    image: ${GATE_IMAGE}
+    ports:
+      - "${BIND_ADDR}:${PANEL_PORT}:8000"
+      - "${BIND_ADDR}:${NODE_UI_PORT}:8001"
+      - "${BIND_ADDR}:${LIGHTNING_UI_PORT}:8002"
+      - "${BIND_ADDR}:${DATUM_UI_PORT}:8003"
+    volumes:
+      - ${DATA_DIR}/gate/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${DATA_DIR}/gate/htpasswd:/etc/nginx/htpasswd:ro
+      - ${DATA_DIR}/gate/panel:/srv/panel:ro
+    networks:
+      default: { ipv4_address: "${NET_PREFIX}.2" }
+
+  tor:
+    <<: *common
+    image: ${TOR_IMAGE}
+    user: "1000:1000"
+    volumes:
+      - ${DATA_DIR}/tor/torrc:/etc/tor/torrc:ro
+      - ${DATA_DIR}/tor/data:/data
+    environment: { HOME: /tmp }
+    networks:
+      default: { ipv4_address: "${NET_PREFIX}.3" }
+
+  i2pd:
+    <<: *common
+    image: ${I2PD_IMAGE}
+    user: root
+    command: --sam.enabled=true --sam.address=0.0.0.0 --sam.port=7656 --loglevel=error
+    volumes:
+      - ${DATA_DIR}/i2pd:/home/i2pd/data
+    networks:
+      default: { ipv4_address: "${NET_PREFIX}.4" }
+
+  # Bitcoin Knots and its dashboard (Horizon's image runs both).
+  knots:
+    <<: *common
+    image: ${KNOTS_IMAGE}
+    user: "1000:1000"
+    # bitcoind flushes its databases on the way out; do not cut it short.
+    stop_grace_period: 15m30s
+    depends_on: [tor, i2pd]
+    ports:
+      - "${P2P_PORT}:${P2P_PORT}"
+    volumes:
+      - ${DATA_DIR}/knots:/data
+    environment:
+      APPS_SUBNET: "${NET_PREFIX}.0/24"
+      P2P_PORT: "${P2P_PORT}"
+      P2P_WHITEBIND_PORT: "8335"
+      RPC_PORT: "8332"
+      TOR_PORT: "8334"
+      ZMQ_RAWBLOCK_PORT: "28332"
+      ZMQ_RAWTX_PORT: "28333"
+      ZMQ_HASHBLOCK_PORT: "28334"
+      ZMQ_SEQUENCE_PORT: "28335"
+      ZMQ_HASHTX_PORT: "28336"
+      TOR_HOST: "${NET_PREFIX}.3"
+      TOR_SOCKS_PORT: "9050"
+      TOR_CONTROL_PORT: "9051"
+      TOR_CONTROL_PASSWORD: "${TOR_PASSWORD}"
+      I2P_HOST: "${NET_PREFIX}.4"
+      I2P_SAM_PORT: "7656"
+      BITCOIND_IP: "${NET_PREFIX}.10"
+      RPC_USER: "${RPC_USER}"
+      RPC_PASS: "${RPC_PASS}"
+      DEVICE_DOMAIN_NAME: "${HOST_NAME}"
+      P2P_HIDDEN_SERVICE: "${P2P_ONION:-notyetset.onion}"
+      RPC_HIDDEN_SERVICE: "notpublished.onion"
+    networks:
+      default: { ipv4_address: "${NET_PREFIX}.10" }
+
+  # Lightning Fork: LND for the BLAKE2b chain. It checks the node's chain at
+  # start and refuses one it cannot confirm.
+  lnd:
+    <<: *common
+    image: ${LND_IMAGE}
+    user: "1000:1000"
+    hostname: "${HOST_NAME}"
+    stop_grace_period: 1m
+    depends_on: [tor, knots]
+    command:
+      - --configfile=/data/.lnd/umbrel-lnd.conf
+      - --listen=0.0.0.0:9735
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --tlsextraip=${NET_PREFIX}.20
+      - --tlsextraip=${LAN_IP}
+      - --bitcoin.active
+      - --bitcoin.mainnet
+      - --bitcoin.node=bitcoind
+      - --bitcoin.chain-identity-file=/status/chain-identity.json
+      - --bitcoind.rpchost=${NET_PREFIX}.10:8332
+      - --bitcoind.rpcuser=${RPC_USER}
+      - --bitcoind.rpcpass=${RPC_PASS}
+      - --bitcoind.zmqpubrawblock=tcp://${NET_PREFIX}.10:28332
+      - --bitcoind.zmqpubrawtx=tcp://${NET_PREFIX}.10:28333
+      - --tor.active
+      - --tor.v3
+      - --tor.control=${NET_PREFIX}.3:9051
+      - --tor.socks=${NET_PREFIX}.3:9050
+      - --tor.targetipaddress=${NET_PREFIX}.20
+      - --tor.password=${TOR_PASSWORD}
+    ports:
+      - "${LND_P2P_PORT}:9735"
+      - "${BIND_ADDR}:${LND_GRPC_PORT}:10009"
+      - "${BIND_ADDR}:${LND_REST_PORT}:8080"
+    volumes:
+      - ${DATA_DIR}/lnd:/data/.lnd
+      - ${DATA_DIR}/lightning/status:/status
+    environment:
+      HOME: /data
+      # Plain TCP listeners instead of Multipath TCP (see CVE-2026-98432).
+      GODEBUG: netdns=cgo,multipathtcp=0
+    sysctls:
+      net.mptcp.enabled: 0
+    networks:
+      default: { ipv4_address: "${NET_PREFIX}.20" }
+
+  # The Lightning dashboard: create the wallet, open channels, pay.
+  # It has no sign-in of its own and answers only the gate.
+  lightning:
+    <<: *common
+    image: ${LIGHTNING_UI_IMAGE}
+    depends_on: [lnd]
+    volumes:
+      - ${DATA_DIR}/lnd:/data/.lnd
+      - ${DATA_DIR}/lightning/app:/data
+    environment:
+      PORT: "3006"
+      TOR_PROXY_IP: "${NET_PREFIX}.3"
+      TOR_PROXY_PORT: "9050"
+      BITCOIN_HOST: "${NET_PREFIX}.10"
+      RPC_PORT: "8332"
+      RPC_USER: "${RPC_USER}"
+      RPC_PASSWORD: "${RPC_PASS}"
+      LND_NETWORK: "mainnet"
+      LND_HOST: "${NET_PREFIX}.20"
+      LND_PORT: "10009"
+      LND_GRPC_PORT: "10009"
+      LND_REST_PORT: "8080"
+      LND_REST_HIDDEN_SERVICE: "notpublished.onion"
+      LND_GRPC_HIDDEN_SERVICE: "notpublished.onion"
+      TLS_FILE: "/data/.lnd/tls.cert"
+      MACAROON_DIR: "/data/.lnd/data/chain/bitcoin/mainnet/"
+      CHANNEL_BACKUP_FILE: "/data/.lnd/data/chain/bitcoin/mainnet/channel.backup"
+      LND_DIR: "/data/.lnd"
+      BACKUP_STATUS_FILE: "/statuses/backup-status.json"
+      JSON_STORE_FILE: "/data/state.json"
+      JSON_SETTINGS_FILE: "/data/settings.json"
+      UMBREL_LND_CONF_FILEPATH: "/data/.lnd/umbrel-lnd.conf"
+      LND_CONF_FILEPATH: "/data/.lnd/lnd.conf"
+      LND_INITIALIZE_WITH_TOR_ONLY: "unset"
+      DEVICE_DOMAIN_NAME: "${HOST_NAME}"
+      EXPLORER_PORT: ""
+      EXPLORER_HIDDEN_SERVICE: ""
+      TRUSTED_PROXY_IPS: "${NET_PREFIX}.2"
+    networks:
+      default: { ipv4_address: "${NET_PREFIX}.21" }
+
+  # DATUM gateway: turns your node's block templates into work for your miner.
+  datum:
+    <<: *common
+    image: ${DATUM_IMAGE}
+    user: "1000:1000"
+    entrypoint: ["/usr/local/bin/datum_gateway"]
+    command: ["-c", "/app/conf/datum_gateway_config.json"]
+    stop_grace_period: 30s
+    depends_on: [knots]
+    ports:
+      - "${STRATUM_PORT}:23334"
+    volumes:
+      - ${DATA_DIR}/datum:/app/conf
+    networks:
+      default: { ipv4_address: "${NET_PREFIX}.30" }
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: "${NET_PREFIX}.0/24"

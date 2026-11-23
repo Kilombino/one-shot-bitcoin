@@ -1,0 +1,32 @@
+{
+  "bitcoind": {
+    "rpcuser": "@RPC_USER@",
+    "rpcpassword": "@RPC_PASS@",
+    "rpcurl": "@NET_PREFIX@.10:8332"
+  },
+  "api": {
+    "listen_port": 7152,
+    "modify_conf": true,
+    "admin_password": "@UI_PASS@"
+  },
+  "mining": {
+    "pool_address": "",
+    "coinbase_tag_primary": "One Shot Bitcoin",
+    "coinbase_tag_secondary": "One Shot Bitcoin",
+    "pow_algorithm": "auto"
+  },
+  "stratum": {
+    "listen_port": 23334,
+    "vardiff_min": "274877906944",
+    "password_difficulty": true,
+    "advertised_host": "@LAN_IP@"
+  },
+  "logger": {
+    "log_level_console": 2
+  },
+  "datum": {
+    "pool_host": "",
+    "pool_pubkey": "dbb11fa0c2b5403e4f798fa6071bb97e6079d219598366032fdf2ae01962b13c5e66e2be7d6b008f0b2603f3e6f6fc64768fa786c8129c46d3e30a5867734b62",
+    "pooled_mining_only": false
+  }
+}

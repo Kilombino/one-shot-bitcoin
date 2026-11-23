@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# One Shot Bitcoin: a Bitcoin (BLAKE2b) node with Lightning and DATUM mining.
+#
+#   ./oneshot install     set it up and start it
+#   ./oneshot status      what is running, and which versions
+#   ./oneshot check       is there a newer set of versions? (changes nothing)
+#   ./oneshot update      show what would change, ask, then update
+#   ./oneshot rollback    go back to the versions you had before the last update
+#   ./oneshot start|stop|restart [service]
+#   ./oneshot logs [service]
+#   ./oneshot password    show the dashboards' user and password
+#   ./oneshot uninstall   stop and remove the containers (your data stays)
+#
+# Nothing here updates on its own. The versions you run are written in
+# state/versions.env, and they change only when you say so.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+STATE="${ROOT}/state"
+CONFIG="${STATE}/config.env"
+INSTALLED="${STATE}/versions.env"
+PREVIOUS="${STATE}/versions.previous.env"
+OFFERED="${ROOT}/versions.env"
+
+# What the user sees for each piece: label, version variable, image variable.
+COMPONENTS=(
+	"Bitcoin Knots|KNOTS_VERSION|KNOTS_IMAGE"
+	"Lightning Fork (LND)|LND_VERSION|LND_IMAGE"
+	"Lightning dashboard|LIGHTNING_UI_VERSION|LIGHTNING_UI_IMAGE"
+	"DATUM gateway|DATUM_VERSION|DATUM_IMAGE"
+	"Tor|TOR_VERSION|TOR_IMAGE"
+	"I2P|I2PD_VERSION|I2PD_IMAGE"
+	"Web gate|GATE_VERSION|GATE_IMAGE"
+)
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+# Read one variable from an env file without sourcing it into this shell.
+get() { ( set +u; . "$1"; eval "printf '%s' \"\${$2:-}\"" ); }
+
+ask() { # ask "question" "default"
+	local answer
+	if [[ -n "${ONESHOT_YES:-}" ]]; then printf '%s\n' "$2"; return; fi
+	read -r -p "$1 [$2]: " answer </dev/tty || true
+	printf '%s\n' "${answer:-$2}"
+}
+
+confirm() { # confirm "question" -> 0 on yes
+	local answer
+	[[ -n "${ONESHOT_YES:-}" ]] && return 0
+	read -r -p "$1 [y/N]: " answer </dev/tty || true
+	[[ "${answer}" =~ ^[YySs] ]]
+}
+
+random() { head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "$1"; }
+
+need_docker() {
+	command -v docker >/dev/null || die "Docker is not installed. See https://docs.docker.com/engine/install/ and run this again."
+	docker compose version >/dev/null 2>&1 || die "Docker is there but 'docker compose' is not. Install the Docker Compose plugin."
+	docker info >/dev/null 2>&1 || die "Cannot talk to Docker. Add your user to the 'docker' group (sudo usermod -aG docker \$USER, then log in again) or run this with sudo."
+	command -v openssl >/dev/null || die "openssl is needed to store the dashboards' password. Install it and run this again."
+}
+
+need_installed() { [[ -f "${CONFIG}" && -f "${INSTALLED}" ]] || die "Not installed yet. Run ./oneshot install"; }
+
+compose() { docker compose --project-directory "${ROOT}" -f "${ROOT}/docker-compose.yml" --env-file "${INSTALLED}" --env-file "${CONFIG}" "$@"; }
+
+versions_table() { # versions_table <file>
+	local row label ver img
+	for row in "${COMPONENTS[@]}"; do
+		IFS='|' read -r label ver img <<<"${row}"
+		printf '  %-22s %s\n' "${label}" "$(get "$1" "${ver}")"
+	done
+}
+
+# Prints the pieces that differ between two version files; returns 1 if none.
+versions_diff() { # versions_diff <from> <to>
+	local row label ver img changed=1
+	for row in "${COMPONENTS[@]}"; do
+		IFS='|' read -r label ver img <<<"${row}"
+		if [[ "$(get "$1" "${img}")" != "$(get "$2" "${img}")" ]]; then
+			printf '  %-22s %s  ->  %s\n' "${label}" "$(get "$1" "${ver}")" "$(get "$2" "${ver}")"
+			printf '  %-22s %s\n' "" "$(get "$2" "${img}")"
+			changed=0
+		fi
+	done
+	return ${changed}
+}
+
+render() { # render <template> <destination>: fill @NAME@ from config.env
+	local out name
+	out="$(cat "$1")"
+	for name in NET_PREFIX P2P_PORT RPC_USER RPC_PASS UI_PASS LAN_IP TOR_HASH; do
+		out="${out//@${name}@/$(get "${CONFIG}" "${name}")}"
+	done
+	printf '%s\n' "${out}" > "$2"
+}
+
+# Files the containers read. The DATUM config is written once: after that its
+# own dashboard owns it.
+write_files() {
+	local data; data="$(get "${CONFIG}" DATA_DIR)"
+	mkdir -p "${data}"/{gate/panel,tor/data,i2pd,knots/app,knots/bitcoin,lnd,lightning/app,lightning/status,datum}
+	render "${ROOT}/templates/torrc" "${data}/tor/torrc"
+	render "${ROOT}/templates/nginx.conf" "${data}/gate/nginx.conf"
+	printf '%s:%s\n' "$(get "${CONFIG}" UI_USER)" "$(openssl passwd -apr1 "$(get "${CONFIG}" UI_PASS)")" > "${data}/gate/htpasswd"
+	[[ -f "${data}/datum/datum_gateway_config.json" ]] || render "${ROOT}/templates/datum_gateway_config.json" "${data}/datum/datum_gateway_config.json"
+	# The node's own settings file: only the prune size, only on first install.
+	if [[ ! -f "${data}/knots/app/settings.json" ]]; then
+		local prune; prune="$(get "${CONFIG}" PRUNE_GB)"
+		if [[ "${prune}" != "0" ]]; then printf '{"prune": %s}\n' "${prune}" > "${data}/knots/app/settings.json"; fi
+	fi
+	cp "${ROOT}/panel/index.html" "${data}/gate/panel/index.html"
+	write_panel_status
+	# The containers run as user 1000 and own their data. Done through Docker so
+	# no sudo is needed. tor/torrc and gate/ stay with whoever runs this script,
+	# which rewrites them on every start.
+	docker run --rm -v "${data}:/d" --entrypoint sh "$(get "${INSTALLED}" GATE_IMAGE)" -c \
+		'chown -R 1000:1000 /d/tor/data /d/knots /d/lnd /d/lightning /d/datum && chmod 700 /d/tor/data' >/dev/null
+}
+
+# What the panel shows: versions installed, versions on offer, where things are.
+write_panel_status() {
+	local data row label ver img sep="" host
+	data="$(get "${CONFIG}" DATA_DIR)"
+	[[ -d "${data}/gate/panel" ]] || return 0
+	{
+		printf '{\n "release": "%s",\n "offered_release": "%s",\n' "$(get "${INSTALLED}" ONESHOT_RELEASE)" "$(get "${OFFERED}" ONESHOT_RELEASE)"
+		printf ' "checked": "%s",\n' "$(date -u +%Y-%m-%dT%H:%MZ)"
+		printf ' "prune_gb": %s,\n' "$(get "${CONFIG}" PRUNE_GB)"
+		printf ' "ports": {"node": %s, "lightning": %s, "datum": %s, "stratum": %s},\n' \
+			"$(get "${CONFIG}" NODE_UI_PORT)" "$(get "${CONFIG}" LIGHTNING_UI_PORT)" "$(get "${CONFIG}" DATUM_UI_PORT)" "$(get "${CONFIG}" STRATUM_PORT)"
+		printf ' "lan_ip": "%s",\n "components": [\n' "$(get "${CONFIG}" LAN_IP)"
+		for row in "${COMPONENTS[@]}"; do
+			IFS='|' read -r label ver img <<<"${row}"
+			printf '%s  {"name": "%s", "installed": "%s", "offered": "%s", "changed": %s, "image": "%s"}' "${sep}" "${label}" \
+				"$(get "${INSTALLED}" "${ver}")" "$(get "${OFFERED}" "${ver}")" \
+				"$([[ "$(get "${INSTALLED}" "${img}")" == "$(get "${OFFERED}" "${img}")" ]] && echo false || echo true)" \
+				"$(get "${INSTALLED}" "${img}")"
+			sep=$',\n'
+		done
+		printf '\n ]\n}\n'
+	} > "${data}/gate/panel/status.json"
+}
+
+cmd_install() {
+	need_docker
+	if [[ -f "${CONFIG}" ]]; then
+		say "Already installed (settings in ${CONFIG}). Starting it."
+		write_files; compose up -d; cmd_status; return
+	fi
+
+	say "One Shot Bitcoin $(get "${OFFERED}" ONESHOT_RELEASE)"
+	say "A Bitcoin (BLAKE2b) node with Lightning and DATUM mining, in Docker."
+	say
+	say "This is what will be installed:"
+	versions_table "${OFFERED}"
+	say
+	say "Every image is pinned by digest in versions.env; nothing updates on its own."
+	say
+
+	local data prune_choice prune lan bind lan_ip
+	data="$(ask "Where should the data go (the chain needs space here)" "${ONESHOT_DATA_DIR:-${HOME}/oneshot-data}")"
+	say
+	say "Full node: keeps every block. Needs hundreds of GB, and it keeps growing."
+	say "Pruned node: verifies everything too, but keeps only the latest blocks."
+	prune_choice="$(ask "Pruned or full? (p/f)" "${ONESHOT_NODE:-p}")"
+	if [[ "${prune_choice}" =~ ^[Ff] ]]; then
+		prune=0
+	else
+		prune="$(ask "Disk for blocks, in GB (10 or more)" "${ONESHOT_PRUNE_GB:-10}")"
+		[[ "${prune}" =~ ^[0-9]+$ && "${prune}" -ge 1 ]] || die "The prune size must be a whole number of GB."
+	fi
+	say
+	say "The dashboards can answer only on this computer, or on your home network too."
+	lan="$(ask "Open the dashboards to your home network? (y/n)" "${ONESHOT_LAN:-n}")"
+	[[ "${lan}" =~ ^[YySs] ]] && bind="0.0.0.0" || bind="127.0.0.1"
+	lan_ip="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1 || true)"
+	[[ -n "${lan_ip}" ]] || lan_ip="127.0.0.1"
+
+	say
+	confirm "Install these versions into ${data}?" || die "Nothing was installed."
+
+	mkdir -p "${STATE}" "${data}"
+	cp "${OFFERED}" "${INSTALLED}"
+
+	local tor_pass tor_hash
+	tor_pass="$(random 32)"
+	say "Fetching Tor to prepare its password..."
+	tor_hash="$(docker run --rm "$(get "${INSTALLED}" TOR_IMAGE)" --quiet --hash-password "${tor_pass}" | tail -n 1)"
+	[[ "${tor_hash}" == 16:* ]] || die "Could not prepare Tor's control password."
+
+	umask 077
+	cat > "${CONFIG}" <<EOF
+# Your settings. Written by ./oneshot install; edit and run ./oneshot restart.
+DATA_DIR=$(readlink -f "${data}")
+PRUNE_GB=${prune}
+BIND_ADDR=${bind}
+LAN_IP=${lan_ip}
+HOST_NAME=$(hostname)
+NET_PREFIX=${ONESHOT_NET_PREFIX:-10.77.77}
+
+# Ports on this computer
+PANEL_PORT=${ONESHOT_PANEL_PORT:-8000}
+NODE_UI_PORT=${ONESHOT_NODE_UI_PORT:-8001}
+LIGHTNING_UI_PORT=${ONESHOT_LIGHTNING_UI_PORT:-8002}
+DATUM_UI_PORT=${ONESHOT_DATUM_UI_PORT:-8003}
+P2P_PORT=${ONESHOT_P2P_PORT:-8333}
+LND_P2P_PORT=${ONESHOT_LND_P2P_PORT:-9735}
+LND_GRPC_PORT=${ONESHOT_LND_GRPC_PORT:-10009}
+LND_REST_PORT=${ONESHOT_LND_REST_PORT:-8080}
+STRATUM_PORT=${ONESHOT_STRATUM_PORT:-23334}
+
+# Generated on this computer, never sent anywhere
+UI_USER=oneshot
+UI_PASS=$(random 20)
+RPC_USER=oneshot
+RPC_PASS=$(random 40)
+TOR_PASSWORD=${tor_pass}
+TOR_HASH=${tor_hash}
+EOF
+	umask 022
+
+	write_files
+	say "Downloading the images (a few minutes the first time)..."
+	compose pull --quiet
+	compose up -d
+	say
+	cmd_status
+	say
+	say "The node now downloads and verifies the chain. That takes from hours to days."
+	say "Lightning starts by itself once the node passes block 961640; then open its"
+	say "dashboard to create your wallet and WRITE DOWN the 24 words it shows."
+}
+
+cmd_status() {
+	need_installed
+	local host
+	[[ "$(get "${CONFIG}" BIND_ADDR)" == "127.0.0.1" ]] && host="127.0.0.1" || host="$(get "${CONFIG}" LAN_IP)"
+	say "Installed (release $(get "${INSTALLED}" ONESHOT_RELEASE)):"
+	versions_table "${INSTALLED}"
+	say
+	compose ps --format 'table {{.Service}}\t{{.Status}}' || true
+	say
+	say "Panel        http://${host}:$(get "${CONFIG}" PANEL_PORT)"
+	say "Node         http://${host}:$(get "${CONFIG}" NODE_UI_PORT)"
+	say "Lightning    http://${host}:$(get "${CONFIG}" LIGHTNING_UI_PORT)"
+	say "Mining       http://${host}:$(get "${CONFIG}" DATUM_UI_PORT)   (miners: stratum+tcp://$(get "${CONFIG}" LAN_IP):$(get "${CONFIG}" STRATUM_PORT))"
+	say "User: $(get "${CONFIG}" UI_USER)    Password: ./oneshot password"
+	write_panel_status
+}
+
+# Brings the newest versions.env from the repository, without applying it.
+fetch_offer() {
+	if git -C "${ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1 && git -C "${ROOT}" remote get-url origin >/dev/null 2>&1; then
+		git -C "${ROOT}" pull --ff-only --quiet || die "Could not bring the latest version list (git pull failed). Nothing was changed."
+	else
+		say "(Not a git checkout with a remote: comparing with the versions.env that is here.)"
+	fi
+}
+
+cmd_check() {
+	need_installed; fetch_offer
+	if versions_diff "${INSTALLED}" "${OFFERED}"; then
+		say; say "Run ./oneshot update to install them."
+	else
+		say "You are running the latest versions on offer."
+	fi
+	write_panel_status
+}
+
+apply_versions() { # apply_versions <file to install>
+	cp "${INSTALLED}" "${PREVIOUS}.tmp"
+	cp "$1" "${INSTALLED}.tmp"
+	cp "${INSTALLED}" "${INSTALLED}.undo"
+	mv "${INSTALLED}.tmp" "${INSTALLED}"
+	# Until the new images are here, nothing running has changed: on any
+	# failure put the version list back as it was.
+	if ! ( write_files && compose pull --quiet ); then
+		mv "${INSTALLED}.undo" "${INSTALLED}"; rm -f "${PREVIOUS}.tmp"
+		die "Could not prepare the new versions. Nothing was changed."
+	fi
+	mv "${PREVIOUS}.tmp" "${PREVIOUS}"; rm -f "${INSTALLED}.undo"
+	compose up -d
+	write_panel_status
+}
+
+cmd_update() {
+	need_installed; need_docker; fetch_offer
+	say "Changes:"
+	versions_diff "${INSTALLED}" "${OFFERED}" || { say "  none: you are running the latest versions on offer."; return; }
+	say
+	say "Read the release notes of each piece before a big jump. A database may not"
+	say "open again with an older version, so going back is not always possible."
+	confirm "Update now?" || { say "Nothing was changed."; return; }
+	apply_versions "${OFFERED}"
+	say "Updated. The versions you had are kept: ./oneshot rollback"
+}
+
+cmd_rollback() {
+	need_installed
+	[[ -f "${PREVIOUS}" ]] || die "There is no earlier set of versions to go back to."
+	say "Going back to:"
+	versions_diff "${INSTALLED}" "${PREVIOUS}" || { say "  nothing differs."; return; }
+	confirm "Go back now?" || { say "Nothing was changed."; return; }
+	local back="${STATE}/versions.rollback.env"
+	cp "${PREVIOUS}" "${back}"; apply_versions "${back}"; rm -f "${back}"
+	say "Done."
+}
+
+cmd_uninstall() {
+	need_installed
+	confirm "Stop and remove the containers? Your data in $(get "${CONFIG}" DATA_DIR) is kept." || return 0
+	compose down
+	say "Removed. To start again: ./oneshot install. To delete the data, remove that directory yourself."
+}
+
+case "${1:-help}" in
+	install)   cmd_install ;;
+	status)    cmd_status ;;
+	check)     cmd_check ;;
+	update)    cmd_update ;;
+	rollback)  cmd_rollback ;;
+	start)     need_installed; shift; compose up -d "$@" ;;
+	stop)      need_installed; shift; compose stop "$@" ;;
+	restart)   need_installed; shift; write_files; compose up -d --force-recreate "$@" ;;
+	logs)      need_installed; shift; compose logs --tail 200 -f "$@" ;;
+	password)  need_installed; say "User: $(get "${CONFIG}" UI_USER)"; say "Password: $(get "${CONFIG}" UI_PASS)" ;;
+	uninstall) cmd_uninstall ;;
+	*)         sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+esac
