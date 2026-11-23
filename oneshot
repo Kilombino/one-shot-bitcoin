@@ -16,12 +16,13 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 STATE="${ROOT}/state"
 CONFIG="${STATE}/config.env"
 INSTALLED="${STATE}/versions.env"
 PREVIOUS="${STATE}/versions.previous.env"
 OFFERED="${ROOT}/versions.env"
+FILES="${STATE}/files"
 
 # What the user sees for each piece: label, version variable, image variable.
 COMPONENTS=(
@@ -56,10 +57,37 @@ confirm() { # confirm "question" -> 0 on yes
 
 random() { head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "$1"; }
 
+# linux, wsl (Linux inside Windows, with Docker Desktop) or mac.
+platform() {
+	case "$(uname -s)" in
+		Darwin) echo mac ;;
+		*) if grep -qi microsoft /proc/version 2>/dev/null; then echo wsl; else echo linux; fi ;;
+	esac
+}
+
+# This computer's address on the home network, for miners and for the links.
+lan_ip() {
+	local ip=""
+	case "$(platform)" in
+		mac) ip="$(ipconfig getifaddr "$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')" 2>/dev/null || true)" ;;
+		# Inside WSL the Linux side has an address of its own; miners need Windows'.
+		wsl) ip="$(powershell.exe -NoProfile -Command "(Get-NetIPConfiguration | Where-Object { \$_.IPv4DefaultGateway } | Select-Object -First 1).IPv4Address.IPAddress" 2>/dev/null | tr -d '\r' | head -n 1 || true)" ;;
+		*) ip="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1 || true)" ;;
+	esac
+	[[ "${ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ip="127.0.0.1"
+	printf '%s' "${ip}"
+}
+
 need_docker() {
 	command -v docker >/dev/null || die "Docker is not installed. See https://docs.docker.com/engine/install/ and run this again."
 	docker compose version >/dev/null 2>&1 || die "Docker is there but 'docker compose' is not. Install the Docker Compose plugin."
-	docker info >/dev/null 2>&1 || die "Cannot talk to Docker. Add your user to the 'docker' group (sudo usermod -aG docker \$USER, then log in again) or run this with sudo."
+	if ! docker info >/dev/null 2>&1; then
+		case "$(platform)" in
+			linux) die "Cannot talk to Docker. Add your user to the 'docker' group (sudo usermod -aG docker \$USER, then log in again) or run this with sudo." ;;
+			wsl) die "Cannot talk to Docker. Start Docker Desktop and turn on Settings > Resources > WSL integration for this distribution." ;;
+			*) die "Cannot talk to Docker. Start Docker Desktop and run this again." ;;
+		esac
+	fi
 	command -v openssl >/dev/null || die "openssl is needed to store the dashboards' password. Install it and run this again."
 }
 
@@ -98,34 +126,43 @@ render() { # render <template> <destination>: fill @NAME@ from config.env
 	printf '%s\n' "${out}" > "$2"
 }
 
-# Files the containers read. The DATUM config is written once: after that its
-# own dashboard owns it.
+# Files the containers read, in state/files. They are rewritten on every start.
+# The data itself lives where config.env says (V_*): folders of yours on
+# Linux, Docker volumes on macOS. Two small files are placed inside the data
+# once and then left alone: the DATUM config (its dashboard owns it afterwards)
+# and the node's prune size.
 write_files() {
-	local data; data="$(get "${CONFIG}" DATA_DIR)"
-	mkdir -p "${data}"/{gate/panel,tor/data,i2pd,knots/app,knots/bitcoin,lnd,lightning/app,lightning/status,datum}
-	render "${ROOT}/templates/torrc" "${data}/tor/torrc"
-	render "${ROOT}/templates/nginx.conf" "${data}/gate/nginx.conf"
-	printf '%s:%s\n' "$(get "${CONFIG}" UI_USER)" "$(openssl passwd -apr1 "$(get "${CONFIG}" UI_PASS)")" > "${data}/gate/htpasswd"
-	[[ -f "${data}/datum/datum_gateway_config.json" ]] || render "${ROOT}/templates/datum_gateway_config.json" "${data}/datum/datum_gateway_config.json"
-	# The node's own settings file: only the prune size, only on first install.
-	if [[ ! -f "${data}/knots/app/settings.json" ]]; then
-		local prune; prune="$(get "${CONFIG}" PRUNE_GB)"
-		if [[ "${prune}" != "0" ]]; then printf '{"prune": %s}\n' "${prune}" > "${data}/knots/app/settings.json"; fi
+	local prune v
+	mkdir -p "${FILES}"/{gate/panel,tor,seed}
+	if [[ "$(get "${CONFIG}" STORAGE)" == "dir" ]]; then
+		for v in V_TOR V_I2PD V_KNOTS V_LND V_LN_APP V_LN_STATUS V_DATUM; do mkdir -p "$(get "${CONFIG}" "${v}")"; done
 	fi
-	cp "${ROOT}/panel/index.html" "${data}/gate/panel/index.html"
+	render "${ROOT}/templates/torrc" "${FILES}/tor/torrc"
+	render "${ROOT}/templates/nginx.conf" "${FILES}/gate/nginx.conf"
+	printf '%s:%s\n' "$(get "${CONFIG}" UI_USER)" "$(openssl passwd -apr1 "$(get "${CONFIG}" UI_PASS)")" > "${FILES}/gate/htpasswd"
+	chmod 644 "${FILES}/gate/htpasswd" "${FILES}/gate/nginx.conf" "${FILES}/tor/torrc"
+	cp "${ROOT}/panel/index.html" "${FILES}/gate/panel/index.html"
+	render "${ROOT}/templates/datum_gateway_config.json" "${FILES}/seed/datum_gateway_config.json"
+	prune="$(get "${CONFIG}" PRUNE_GB)"
+	rm -f "${FILES}/seed/settings.json"
+	if [[ "${prune}" != "0" ]]; then printf '{"prune": %s}\n' "${prune}" > "${FILES}/seed/settings.json"; fi
 	write_panel_status
-	# The containers run as user 1000 and own their data. Done through Docker so
-	# no sudo is needed. tor/torrc and gate/ stay with whoever runs this script,
-	# which rewrites them on every start.
-	docker run --rm -v "${data}:/d" --entrypoint sh "$(get "${INSTALLED}" GATE_IMAGE)" -c \
-		'chown -R 1000:1000 /d/tor/data /d/knots /d/lnd /d/lightning /d/datum && chmod 700 /d/tor/data' >/dev/null
+	# The containers run as user 1000 and own their data. Done through Docker,
+	# so it works the same on a folder and on a volume, and needs no sudo.
+	docker run --rm --entrypoint sh \
+		-v "$(get "${CONFIG}" V_TOR):/v/tor" -v "$(get "${CONFIG}" V_KNOTS):/v/knots" -v "$(get "${CONFIG}" V_LND):/v/lnd" \
+		-v "$(get "${CONFIG}" V_LN_APP):/v/ln-app" -v "$(get "${CONFIG}" V_LN_STATUS):/v/ln-status" -v "$(get "${CONFIG}" V_DATUM):/v/datum" \
+		-v "${FILES}/seed:/seed:ro" "$(get "${INSTALLED}" GATE_IMAGE)" -c '
+			[ -f /v/datum/datum_gateway_config.json ] || cp /seed/datum_gateway_config.json /v/datum/
+			mkdir -p /v/knots/app /v/knots/bitcoin
+			if [ ! -f /v/knots/app/settings.json ] && [ -f /seed/settings.json ]; then cp /seed/settings.json /v/knots/app/; fi
+			chown -R 1000:1000 /v/tor /v/knots /v/lnd /v/ln-app /v/ln-status /v/datum && chmod 700 /v/tor' >/dev/null
 }
 
 # What the panel shows: versions installed, versions on offer, where things are.
 write_panel_status() {
-	local data row label ver img sep="" host
-	data="$(get "${CONFIG}" DATA_DIR)"
-	[[ -d "${data}/gate/panel" ]] || return 0
+	local row label ver img sep=""
+	[[ -d "${FILES}/gate/panel" ]] || return 0
 	{
 		printf '{\n "release": "%s",\n "offered_release": "%s",\n' "$(get "${INSTALLED}" ONESHOT_RELEASE)" "$(get "${OFFERED}" ONESHOT_RELEASE)"
 		printf ' "checked": "%s",\n' "$(date -u +%Y-%m-%dT%H:%MZ)"
@@ -142,7 +179,7 @@ write_panel_status() {
 			sep=$',\n'
 		done
 		printf '\n ]\n}\n'
-	} > "${data}/gate/panel/status.json"
+	} > "${FILES}/gate/panel/status.json"
 }
 
 cmd_install() {
@@ -161,8 +198,16 @@ cmd_install() {
 	say "Every image is pinned by digest in versions.env; nothing updates on its own."
 	say
 
-	local data prune_choice prune lan bind lan_ip
-	data="$(ask "Where should the data go (the chain needs space here)" "${ONESHOT_DATA_DIR:-${HOME}/oneshot-data}")"
+	local data="" storage prune_choice prune lan bind lan_ip
+	# On macOS the data goes in Docker volumes: a node on a shared Mac folder is
+	# many times slower. On Linux (and Linux inside Windows) it is a folder.
+	storage="${ONESHOT_STORAGE:-$([[ "$(platform)" == "mac" ]] && echo volumes || echo dir)}"
+	if [[ "${storage}" == "dir" ]]; then
+		data="$(ask "Where should the data go (the chain needs space here)" "${ONESHOT_DATA_DIR:-${HOME}/oneshot-data}")"
+	else
+		say "The data will be kept in Docker volumes (oneshot_knots, oneshot_lnd and others)."
+		say "Give Docker Desktop enough disk: Settings > Resources > Disk usage limit."
+	fi
 	say
 	say "Full node: keeps every block. Needs hundreds of GB, and it keeps growing."
 	say "Pruned node: verifies everything too, but keeps only the latest blocks."
@@ -177,13 +222,13 @@ cmd_install() {
 	say "The dashboards can answer only on this computer, or on your home network too."
 	lan="$(ask "Open the dashboards to your home network? (y/n)" "${ONESHOT_LAN:-n}")"
 	[[ "${lan}" =~ ^[YySs] ]] && bind="0.0.0.0" || bind="127.0.0.1"
-	lan_ip="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1 || true)"
-	[[ -n "${lan_ip}" ]] || lan_ip="127.0.0.1"
+	lan_ip="$(lan_ip)"
 
 	say
-	confirm "Install these versions into ${data}?" || die "Nothing was installed."
+	confirm "Install these versions${data:+ into ${data}}?" || die "Nothing was installed."
 
-	mkdir -p "${STATE}" "${data}"
+	mkdir -p "${STATE}"
+	if [[ "${storage}" == "dir" ]]; then mkdir -p "${data}"; data="$(cd "${data}" && pwd -P)"; fi
 	cp "${OFFERED}" "${INSTALLED}"
 
 	local tor_pass tor_hash
@@ -195,8 +240,19 @@ cmd_install() {
 	umask 077
 	cat > "${CONFIG}" <<EOF
 # Your settings. Written by ./oneshot install; edit and run ./oneshot restart.
-DATA_DIR=$(readlink -f "${data}")
 PRUNE_GB=${prune}
+FILES_DIR=${FILES}
+
+# Where each piece keeps its data: folders ("dir") or Docker volumes ("volumes")
+STORAGE=${storage}
+DATA_DIR=${data}
+V_TOR=$([[ "${storage}" == "dir" ]] && echo "${data}/tor" || echo oneshot_tor)
+V_I2PD=$([[ "${storage}" == "dir" ]] && echo "${data}/i2pd" || echo oneshot_i2pd)
+V_KNOTS=$([[ "${storage}" == "dir" ]] && echo "${data}/knots" || echo oneshot_knots)
+V_LND=$([[ "${storage}" == "dir" ]] && echo "${data}/lnd" || echo oneshot_lnd)
+V_LN_APP=$([[ "${storage}" == "dir" ]] && echo "${data}/lightning-app" || echo oneshot_lightning_app)
+V_LN_STATUS=$([[ "${storage}" == "dir" ]] && echo "${data}/lightning-status" || echo oneshot_lightning_status)
+V_DATUM=$([[ "${storage}" == "dir" ]] && echo "${data}/datum" || echo oneshot_datum)
 BIND_ADDR=${bind}
 LAN_IP=${lan_ip}
 HOST_NAME=$(hostname)
@@ -312,9 +368,11 @@ cmd_rollback() {
 
 cmd_uninstall() {
 	need_installed
-	confirm "Stop and remove the containers? Your data in $(get "${CONFIG}" DATA_DIR) is kept." || return 0
+	local where="in $(get "${CONFIG}" DATA_DIR)"
+	[[ "$(get "${CONFIG}" STORAGE)" == "dir" ]] || where="in the Docker volumes named oneshot_*"
+	confirm "Stop and remove the containers? Your data ${where} is kept." || return 0
 	compose down
-	say "Removed. To start again: ./oneshot install. To delete the data, remove that directory yourself."
+	say "Removed. To start again: ./oneshot install. Deleting the data is yours to do: it is ${where}."
 }
 
 case "${1:-help}" in

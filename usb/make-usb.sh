@@ -32,7 +32,9 @@ xorriso_run() {
 	if command -v xorriso >/dev/null; then
 		( cd "${BUILD}" && xorriso "$@" )
 	elif command -v docker >/dev/null; then
-		docker run --rm -v "${BUILD}:/w" -w /w alpine:3.22 sh -c 'apk add --no-cache xorriso >/dev/null && xorriso "$@"' xorriso "$@"
+		# Runs as root inside the container; hand what it wrote back to you.
+		docker run --rm -e OWNER="$(id -u):$(id -g)" -v "${BUILD}:/w" -w /w alpine:3.22 sh -c \
+			'apk add --no-cache xorriso >/dev/null && xorriso "$@"; rc=$?; chown "$OWNER" /w/* 2>/dev/null; exit $rc' xorriso "$@"
 	else
 		die "xorriso is needed (sudo apt install xorriso), or Docker to run it in."
 	fi
@@ -52,7 +54,7 @@ gpg --quiet --verify SHA256SUMS.gpg SHA256SUMS 2>/dev/null || die "Ubuntu's SHA2
 ISO="$(sed -n 's/^[0-9a-f]\{64\} \*\(ubuntu-24\.04[0-9.]*-live-server-amd64\.iso\)$/\1/p' SHA256SUMS | sort -V | tail -n 1)"
 [[ -n "${ISO}" ]] || die "No Ubuntu Server image found in SHA256SUMS."
 
-echo "2/4 Downloading ${ISO} (about 3 GB; resumes if interrupted)..."
+echo "2/4 Downloading ${ISO} (about 4 GB; resumes if interrupted)..."
 curl -fL -C - -o "${ISO}" "${RELEASES}/${ISO}"
 grep " \*${ISO}\$" SHA256SUMS | sha256sum -c --quiet - || die "${ISO} does not match Ubuntu's checksum. Delete it and run this again."
 
