@@ -1,0 +1,27 @@
+#cloud-config
+# One Shot Bitcoin USB: Ubuntu Server's own installer, with the questions that
+# are yours to answer left to you (language, keyboard, network, WHICH DISK to
+# erase, your user and password), and the rest done for you: Docker, and One
+# Shot Bitcoin ready to start at your first login.
+autoinstall:
+  version: 1
+  interactive-sections:
+    - locale
+    - keyboard
+    - network
+    - storage
+    - identity
+  ssh:
+    install-server: true
+    allow-pw: true
+  packages:
+    - docker.io
+    - docker-compose-v2
+    - git
+    - openssl
+    - curl
+  late-commands:
+    - mkdir -p /target/opt/one-shot-bitcoin
+    - tar -xzf /cdrom/oneshot/one-shot-bitcoin.tar.gz -C /target/opt/one-shot-bitcoin
+    - cp /cdrom/oneshot/first-login.sh /target/etc/profile.d/oneshot-first-login.sh
+    - chmod 644 /target/etc/profile.d/oneshot-first-login.sh
